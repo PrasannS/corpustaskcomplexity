@@ -1,0 +1,178 @@
+"""
+The launch half: take resolved options and either run here or hand them to Beaker.
+
+Kept apart from :mod:`recipe` because "what to train" and "where to run it" are independent, and in
+the pre-migration tree they were not -- a Beaker launcher and its local twin were separate files
+that drifted, so the local run and the cluster run were not the same experiment.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from typing import List
+
+from options import TrainOptions, describe
+
+__all__ = ["run"]
+
+
+def _check_base_is_a_checkpoint(base: str) -> None:
+    """
+    Fail early, and with the fix in the message, if ``--base`` is not a checkpoint olmo-core loads.
+
+    olmo-core accepts either a checkpoint directory or a directory of ``stepN/`` checkpoints. A
+    directory that merely *contains* ``model_and_optim/`` -- which is exactly what
+    ``save_model_and_optim_state`` writes, and therefore what a marker-repair script produces -- is
+    neither. With ``load_strategy=always`` the run does fail rather than train from random init, but
+    it fails from inside ``trainer.fit()``, after both GPUs have built the model and FSDP has
+    wrapped it: ~2 minutes of a multi-GPU allocation to learn about a missing path component.
+
+    Only local directories are checked. A remote ``s3://``/``gs://`` base is left to olmo-core.
+
+    :param base: The ``--base`` path.
+
+    :raises SystemExit: If the path exists locally but is not loadable as a checkpoint.
+    """
+    if not os.path.isdir(base):
+        return
+
+    from olmo_core.train.checkpoint import Checkpointer
+
+    if Checkpointer.contains_checkpoint(base):
+        return
+    hint = ""
+    if Checkpointer.contains_checkpoint(os.path.join(base, "model_and_optim")):
+        hint = (
+            f"\nIt holds a loadable checkpoint one level down. Pass:\n"
+            f"    --base {os.path.join(base, 'model_and_optim')}"
+        )
+    raise SystemExit(
+        f"--base {base!r} is not a checkpoint olmo-core can load: it is neither a checkpoint "
+        f"directory (a '.metadata', or all of 'train/rank0.pt' + 'model_and_optim/.metadata' + "
+        f"'.metadata.json') nor a directory of 'stepN/' checkpoints.{hint}"
+    )
+
+
+def _record_config(trainer, *configs) -> None:
+    """
+    Hand the assembled configuration to the ``config_saver`` callback.
+
+    The callback is attached in :mod:`recipe`, but it writes nothing until someone sets its
+    ``config`` -- it logs *"Config not set on ConfigSaverCallback, doing nothing"* and returns. So
+    every checkpoint this repo trained came out with ``model_and_optim/``, a fingerprint, and **no
+    ``config.json``**.
+
+    That is not cosmetic provenance. ``TransformerGenerationModule.from_checkpoint`` reads
+    ``<ckpt>/config.json`` to rebuild the model, so without it the native eval backend cannot load
+    the checkpoint at all: `ctc-eval` died before its first prompt on anything trained here. The
+    train->eval loop could not be closed until this was set.
+
+    :param trainer: The built trainer, whose callbacks the config is recorded on.
+    :param configs: ``(model, train_module, dataset, data_loader, trainer_cfg)``, in the order
+        :func:`recipe.build_experiment` returns them. Keys match olmo-core's own experiment config
+        so a reader -- and ``from_checkpoint``, which wants ``config_dict["model"]`` -- finds what
+        it expects.
+    """
+    saver = trainer.callbacks.get("config_saver")
+    if saver is None:  # a recipe that dropped the callback; nothing to record on
+        return
+    names = ("model", "train_module", "dataset", "data_loader", "trainer")
+    saver.config = {name: cfg.as_config_dict() for name, cfg in zip(names, configs)}
+
+
+def _save_folder(options: TrainOptions, root_dir: str) -> str:
+    if options.save_folder:
+        return options.save_folder
+    if options.is_local:
+        # Node-local disk. /accounts and /scratch are both NFS at ~5 MB/s, and a checkpoint write
+        # there does not merely run slow -- concurrent readers deadlock in nfs_wait_bit_killable.
+        return f"/data/prasann/ctc_runs/{options.run_name}"
+    return f"{root_dir}/checkpoints/prasanns/{options.run_name}"
+
+
+def run(options: TrainOptions, argv: List[str]) -> int:
+    """
+    Build the experiment and either fit it locally or submit it to Beaker.
+
+    :param options: Resolved options.
+    :param argv: The original argument vector, replayed verbatim on the Beaker node so the on-node
+        rebuild sees exactly this configuration. The pre-migration launchers re-read some settings
+        from the launch host's environment, which is not propagated, so the node silently rebuilt
+        with module defaults.
+
+    :returns: Process exit status.
+    """
+    print(describe(options))
+
+    from olmo_core.internal.common import get_root_dir, get_work_dir
+    from olmo_core.utils import prepare_cli_environment, seed_all
+
+    prepare_cli_environment()
+
+    if options.base:
+        _check_base_is_a_checkpoint(options.base)
+
+    root_dir = get_root_dir(options.cluster) if not options.is_local else ""
+    work_dir = str(get_work_dir(root_dir)) if not options.is_local else "/data/prasann/ctc_work"
+    save_folder = _save_folder(options, root_dir)
+
+    from recipe import beaker_launch_config, build_experiment
+
+    if not options.is_local:
+        launch = beaker_launch_config(
+            options,
+            cmd=["python", "src/scripts/ctc/train/" + argv[0], *argv[1:]],
+            root_dir=root_dir,
+        )
+        if launch is not None:
+            launch.launch(follow=True)
+            return 0
+
+    model, train_module, dataset, data_loader, trainer_cfg = build_experiment(
+        options, save_folder=save_folder, work_dir=work_dir
+    )
+    for override in options.overrides:
+        trainer_cfg = trainer_cfg.merge([override])
+
+    seed_all(options.seed)
+    from olmo_core.distributed.utils import init_distributed
+
+    # GLOO alongside NCCL, matching olmo-core's own `prepare_training_environment` default. The
+    # checkpointer runs async saves and bookkeeping collectives on a CPU-capable backend so they do
+    # not block training; with NCCL alone the run dies in the checkpointer's `pre_train` with
+    # "a CPU-capable backend is required for async checkpointing" -- after the model is built.
+    init_distributed(backend="cpu:gloo,cuda:nccl")
+
+    model_instance = model.build()
+    train_module_instance = train_module.build(model_instance)
+    # `ComposableDataLoaderConfig.build` takes built InstanceSources, not their configs. Handing it
+    # the config fails late and obscurely -- `TypeError: object of type
+    # 'PadToLengthInstanceSourceConfig' has no len()` from inside the loader, after the model is
+    # already on the GPU -- because a Config has no __len__ for the instance-count check.
+    loader = data_loader.build(dataset.build(work_dir))
+    trainer = trainer_cfg.build(train_module_instance, loader)
+    _record_config(trainer, model, train_module, dataset, data_loader, trainer_cfg)
+    trainer.fit()
+    return 0
+
+
+def main(argv: List[str], *, mode: str, description: str) -> int:
+    """
+    Shared entry point for ``sft.py`` and ``cpt.py``.
+
+    :param argv: ``sys.argv``; element 0 is the script name, replayed for the Beaker node.
+    :param mode: ``"sft"`` or ``"cpt"``.
+    :param description: Help text.
+
+    :returns: Process exit status.
+    """
+    from options import build_parser, options_from_args
+
+    args = build_parser(description, mode=mode).parse_args(argv[1:])
+    options = options_from_args(args, mode=mode)
+    return run(options, [argv[0].rsplit("/", 1)[-1], *argv[1:]])
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main(sys.argv, mode="sft", description=__doc__))

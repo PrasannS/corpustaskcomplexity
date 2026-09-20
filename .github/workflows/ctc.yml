@@ -1,0 +1,33 @@
+# The CTC suite's own tests: pure python, no GPU, no network, no secrets.
+#
+# Upstream OLMo-core's workflows (full GPU test matrix, Docker image builds, PyPI release,
+# dependabot) were removed with the fork — they need AI2's Beaker/AWS/GCS credentials and would
+# fail on every push here. Run them from upstream if you need them.
+name: CTC
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  tests:
+    name: ctc tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: pip install ./ctc pytest
+      - run: pytest ctc/tests -q

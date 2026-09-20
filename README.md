@@ -1,188 +1,253 @@
-<div align="center">
-  <!-- <img src="https://github.com/allenai/OLMo/assets/8812459/774ac485-a535-4768-8f7c-db7be20f5cc3" width="300"/> -->
-  <img src="https://huggingface.co/datasets/allenai/blog-images/resolve/main/olmo2/olmo.png" alt="OLMo Logo" width="280" style="margin-left:'auto' margin-right:'auto' display:'block'"/>
-  <br>
-  <h1>OLMo-core</h1>
-  <h4>Building blocks for OLMo modeling and training</h4>
-</div>
-<p align="center">
-  <a href="https://olmo-core.readthedocs.io/en/latest/">
-    <img alt="Docs" src="https://img.shields.io/badge/API-docs-red">
-  </a>
-  <a href="https://github.com/allenai/OLMo-core/tree/main/src/examples">
-    <img alt="Examples" src="https://img.shields.io/badge/API-examples-994B00">
-  </a>
-  <a href="https://github.com/allenai/OLMo-core/releases/tag/v1.9.0">
-    <img alt="Pypi" src="https://img.shields.io/pypi/v/ai2-olmo-core.svg">
-  </a>
-  <a href="https://github.com/allenai/OLMo-core/blob/main/LICENSE">
-    <img alt="GitHub License" src="https://img.shields.io/github/license/allenai/OLMo">
-  </a>
-  <a href="https://arxiv.org/pdf/2501.00656.pdf">
-    <img alt="Paper URL" src="https://img.shields.io/badge/arxiv-2402.00838-orange">
-  </a>
-  <a href="https://playground.allenai.org">
-    <img alt="Playground" src="https://img.shields.io/badge/Ai2-Playground-F0529C">
-  </a>
-  <a href="https://discord.gg/sZq3jTNVNG">
-    <img alt="Discord" src="https://img.shields.io/badge/Discord%20-%20blue?style=flat&logo=discord&label=Ai2&color=%235B65E9">
-  </a>
-</p>
+# Corpus Task Complexity (CTC)
 
-## Installation
+**22 long-context tasks whose difficulty scales with how much of an in-prompt corpus a model has to
+track at once — with context ladders from 2k to 1M+ tokens, the generators that build them, and the
+training code to fine-tune against them.**
 
-First install [PyTorch](https://pytorch.org) according to the instructions specific to your operating system and hardware.
+A CTC task puts N documents in the prompt and asks a question that cannot be answered from any one
+of them. The tasks span a complexity axis:
 
-For development, we recommend installing from source:
+| class | what the answer requires | examples |
+|---|---|---|
+| **O(N)** | find the answer-bearing document — in principle solvable by a retriever | retrieval (NQ, FiQA, HotpotQA, SciFact, MS MARCO), NIAH, OOLONG, absence, outlier with fixed K |
+| **O(N²)** | a *relation over* documents, with no single span to retrieve | every contradicting pair; query↔document matching; exact-copy orphans; restoring shuffled order; planted shared word-runs |
+| **O(NM)** / **O(N³)** | structure over the whole corpus | cluster everything; find the planted feature-sum triple |
+
+That axis scales *independently* of context length, which is the point: a model that merely
+retrieves well separates from one that tracks a corpus long before either runs out of context
+window.
+
+**Browse real examples — every task, every rung:**
+[corpus-reasoning-viz.pages.dev](https://corpus-reasoning-viz.pages.dev/) — gold documents
+highlighted, the exact model prompt, the exact target string.
+
+| resource | where |
+|---|---|
+| Eval ladders — 22 tasks × up to 10 rungs | [`PrasannSinghal/ctc-suite-eval`](https://huggingface.co/datasets/PrasannSinghal/ctc-suite-eval) (public, parquet) |
+| Seed pools — the expensive half of generation, precomputed | [`PrasannSinghal/ctc-seed-pools`](https://huggingface.co/datasets/PrasannSinghal/ctc-seed-pools) (public) |
+| Benchmark harness | [`allenai/olmo-eval`](https://github.com/allenai/olmo-eval), branch `prasann/ctc-suite-grader-fixes` |
+
+---
+
+## Install
 
 ```bash
-git clone https://github.com/allenai/OLMo-core.git
-cd OLMo-core
-pip install -e .[all]
+git clone https://github.com/PrasannS/corpustaskcomplexity && cd corpustaskcomplexity
+
+pip install ./ctc          # data generation + evaluation. No GPU, no CUDA, no compiler.
+pip install -e '.[all]'    # the training side (OLMo-core). Install torch for your CUDA first.
 ```
-Or you can install from PyPI with:
+
+The two halves are deliberately separable. **If you only want the data and the benchmark, the first
+line is enough** — `ctc` imports no `olmo_core`, and the task JSONL it emits is a
+framework-agnostic interface you can tokenize however you like.
 
 ```bash
-pip install ai2-olmo-core
+pytest ctc/tests           # ~1250 tests, no GPU, no network, ~2 min
 ```
 
-There are a number of optional dependencies that must be installed to use certain functionality as well, including:
-
-- [flash-attn](https://github.com/Dao-AILab/flash-attention), [ring-flash-attn](https://github.com/zhuzilin/ring-flash-attention), and [TransformerEngine](https://github.com/NVIDIA/TransformerEngine) for the corresponding attention backends.
-- [Liger-Kernel](https://github.com/linkedin/Liger-Kernel) for a low-memory "fused-linear" loss implementation.
-- [torchao](https://github.com/pytorch/ao) for float8 training.
-- [grouped_gemm](https://github.com/tgale96/grouped_gemm) for dropless mixture-of-experts (MoE) models. You may need to compile from source until [PR #21](https://github.com/tgale96/grouped_gemm/pull/21) is released (post v0.1.6).
-- [QuACK](https://github.com/Dao-AILab/quack) for some CuTe-based kernels.
-
-The published [Docker images](https://github.com/orgs/allenai/packages?repo_name=OLMo-core) contain all core and optional dependencies, and are regularly tested on our in-house H100 clusters.
-But there are several things to keep in mind if you intend to use these images:
-
-- They do not come with the OLMo-core package installed, only its dependencies, to accommodate for regular code changes.
-- They may not work on your own cluster if you have different hardware or driver/CUDA versions.
-
-If the published images do not work for your use-case for any of the above reasons, you could adapt our [Dockerfile](https://github.com/allenai/OLMo-core/blob/main/src/Dockerfile) to build your own images.
-
-## Official training scripts
-
-Official training scripts for released models can be found in [`src/scripts/official/`](https://github.com/allenai/OLMo-core/tree/main/src/scripts/official).
-
-These scripts are meant to be launched with ``torchrun``, or with OLMo-core's Beaker launch CLI if you have access to Beaker.
-
-For example:
+## Quickstart: from nothing to a graded number
 
 ```bash
-torchrun --nproc-per-node=8 src/scripts/official/OLMo2/OLMo-2-0325-32B-train.py \
-  --save-folder=/path/to/save/checkpoints
+# 1. build a training set and an eval ladder  (no GPU, no index, no API key)
+ctc-data build --task contradiction --pool auto --train 18000 --out data/
+ctc-data build --task contradiction --split eval --rungs 2k,8k,32k --out data/
+
+# 2. tokenize to OLMo-core shards
+PYTHONPATH=src:ctc/src python src/scripts/ctc/convert_to_shards.py \
+    --input data/contradiction/train.jsonl --out shards/contradiction \
+    --layout chunked --query-position after
+
+# 3. fine-tune
+CTC_NPROC=8 run/train.sh my-run --data shards/contradiction:1 \
+    --base /path/to/qwen3.5-4b --arch chunked-mix --model qwen3_5_4B --tokenizer qwen3_5 \
+    --lr 5e-5 --max-steps 7500
+
+# 4. grade it
+ctc-eval --ckpt runs/my-run/step7500 --tasks contradiction --bundle data/ --backend vllm
 ```
 
-You can override most configuration options from the command-line. For example, to override the learning rate you could launch the script like this:
+The four stages are threaded by a **format fingerprint** — recorded beside the shards at tokenize
+time, written into every checkpoint at train time, checked at eval time. Eval refuses to grade a
+checkpoint against a format it was not trained on. This is not decorative: reproducing one
+pre-migration number cost two extra training runs to discover that `query_position` differed,
+because nothing had recorded it.
+
+---
+
+## 1. Data generation
+
+Every corpus-backed task has a published **seed pool** — the expensive half of generation
+(cross-encoder scores, BM25 hard negatives, LLM-mined pairs) precomputed and shipped. `--pool auto`
+fetches it from the Hub, so a 20k-example build takes about a minute and needs no GPU, no Lucene
+index and no API key. The synthetic tasks need nothing at all.
 
 ```bash
-torchrun --nproc-per-node=8 src/scripts/official/OLMo2/OLMo-2-0325-32B-train.py \
-  --save-folder=/path/to/save/checkpoints \
-  --train_module.optim.lr=6e-3
+ctc-data list                                                   # every task, its ladder, its knobs
+ctc-data build --task nq --pool auto --train 20000 --out data/
+ctc-data build --task textgroups --train 20000 --out data/      # synthetic: no pool needed
+
+# rungs are open-ended past the calibrated 2k–32k table
+ctc-data build --task textgroups --split eval --rungs 64k,1m,10m \
+    --eval-size 125 --allow-small-eval --out data/xlong
 ```
 
-To continue annealing from a checkpoint, we use a separate script which can be launched like this:
+Rungs above 32k are extrapolated from a least-squares fit through each task's own measured 2k–32k
+table, and the ladder **refuses a rung its source corpus cannot supply** (qdmatch over HotpotQA
+exhausts all 4,000 labeled units at 256k; strmatch is vocabulary-bound at 48k). Every build runs an
+audit and writes nothing that fails it. Per-task supply bounds, corpus requirements and the
+pool-export path are in [`ctc/src/ctc/data/README.md`](ctc/src/ctc/data/README.md).
+
+**Coverage note.** 18 of the 22 suite rows have generators in this tree. The other four
+(`msmarco`, `niah`, `obliq`, `qdmatch_fiqa`) were built with pre-migration pipelines and are served
+ready-made in the public eval dataset.
+
+## 2. Tokenizing to shards
 
 ```bash
-torchrun --nproc-per-node=8 src/scripts/official/OLMo2/OLMo-2-0325-32B-anneal.py \
-  --save-folder=/path/to/save/checkpoints \
-  --checkpoint=https://storage.googleapis.com/ai2-llm/peteish32/step721901
+PYTHONPATH=src:ctc/src python src/scripts/ctc/convert_to_shards.py \
+    --input data/contradiction/train.jsonl --out shards/contradiction \
+    --layout chunked --query-position after
 ```
 
-### Available Training Scripts
+`--layout` and `--query-position` enter the fingerprint here. The flags that must be reproduced at
+eval time — and which of them are checked automatically — are listed in
+[`src/scripts/ctc/README.md`](src/scripts/ctc/README.md).
 
-| Model Family | Directory | Description |
-|--------------|-----------|-------------|
-| **OLMo-2** | [`src/scripts/official/OLMo2/`](https://github.com/allenai/OLMo-core/tree/main/src/scripts/official/OLMo2) | Training scripts and model card for OLMo-2 32B models |
-| **OLMo-3** | [`src/scripts/official/OLMo3/`](https://github.com/allenai/OLMo-core/tree/main/src/scripts/official/OLMo3) | Training scripts and model cards for OLMo-3 7B and 32B models |
+## 3. Training
 
-## Inference
-
-### With Hugging Face Transformers
-
-You can use our Hugging Face [transformers](https://github.com/huggingface/transformers) integration to run inference on the OLMo checkpoints:
+One parameterised recipe, the experiment axes as flags — locally under `torchrun`, or on Beaker
+with the same options plus `--cluster`.
 
 ```bash
-pip install transformers>=4.57.0
+CTC_NPROC=8 run/train.sh ctc-contradiction-chunked \
+    --data shards/contradiction:1 --base BASE --arch chunked-mix \
+    --model qwen3_5_4B --tokenizer qwen3_5 --lr 5e-5 --max-steps 7500
 ```
 
-```python
-from transformers import AutoModelForCausalLM, AutoTokenizer
-olmo = AutoModelForCausalLM.from_pretrained("allenai/Olmo-3-1125-32B")
-tokenizer = AutoTokenizer.from_pretrained("allenai/Olmo-3-1125-32B")
-message = ["Language modeling is "]
-inputs = tokenizer(message, return_tensors='pt', return_token_type_ids=False)
-# inputs = {k: v.to('cuda') for k,v in inputs.items()} # optional verifying cuda
-# olmo = olmo.to('cuda')
-response = olmo.generate(**inputs, max_new_tokens=100, do_sample=True, temperature=1.0, top_p=0.7)
-print(tokenizer.batch_decode(response, skip_special_tokens=True)[0])
-```
+`--data DIR[:WEIGHT]` is repeatable and the weights are ratios, so `a:2 b:1` mixes 2:1. `--arch` is
+one of:
 
-Alternatively, with the Hugging Face pipeline abstraction:
+- `full` — plain causal attention over the identical marker-bearing token stream.
+- `chunked` — the document-chunked mask, strictly (p = 0 always).
+- `chunked-mix` — the chunked mask **plus the mask-mixing curriculum** (each example collapses to
+  plain causal with probability p, annealed 0.80 → 0.0 over the run). **This is the arm published
+  "chunked" numbers use.** It is a different arm from `chunked`; don't relabel one as the other.
+- `hierarchical`, `landmark` — the sparse-attention variants.
 
-```python
-from transformers import pipeline
-olmo_pipe = pipeline("text-generation", model="allenai/Olmo-3-1125-32B")
-print(olmo_pipe("Language modeling is"))
-```
+> ⚠ **A fresh Qwen3 base needs its marker embeddings repaired first.** Qwen3 never trains the
+> reserved marker rows the document-chunked layout is built on, so they are bit-identical: the
+> model cannot distinguish an open-document marker from a close one, and marker-dense training goes
+> to chance in a way that reads exactly like a modeling result. Run
+> `src/scripts/ctc/fix_marker_embeddings.py` (`--check-only` audits without writing). Qwen3.5 bases
+> do **not** need this — audited at 0.8B/2B/4B/9B. The trainer's `--base` error text says so too.
 
-### With vLLM
+## 4. Evaluation
 
-[vLLM](https://docs.vllm.ai/en/latest/) provides high-throughput inference for OLMo models. You can use it for offline batched inference:
+### The olmo-eval CTC bench
+
+The 22-row suite runs as a task family in AI2's eval harness against the public HF dataset —
+nothing from this repo required.
 
 ```bash
-pip install vllm>=0.11.0
+git clone -b prasann/ctc-suite-grader-fixes https://github.com/allenai/olmo-eval
+cd olmo-eval
+
+uv run olmo-eval run -m mock -t ctc_contradiction:r32k --dry-run   # preview, no model
+uv run olmo-eval run -m <model> -t ctc_nq:r64k --save-predictions  # one task, one rung
 ```
 
-```python
-from vllm import LLM, SamplingParams
-llm = LLM(model="allenai/Olmo-3-1125-32B")
-sampling_params = SamplingParams(temperature=1.0, top_p=0.7)
-prompts = ["Language modeling is"]
-outputs = llm.generate(prompts, sampling_params)
-for output in outputs:
-    prompt = output.prompt
-    generated_text = output.outputs[0].text
-    print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
-```
-
-For more details, see the [vLLM documentation](https://docs.vllm.ai/en/latest/getting_started/quickstart/#offline-batched-inference).
-
-### With Olmo-core (beta)
-
-Autoregressive generation is supported directly in Olmo-core. Using this capability, we provide a chat-loop demo that can be used to interact with models in an interactive chat session:
+Suites cut the same 22 tasks along two orthogonal axes:
 
 ```bash
-python -m olmo_core.generate.chat https://olmo-checkpoints.org/ai2-llm/Olmo-3-1025-7B/stage3/step11921/ --max-new-tokens 512
+# by context length
+uv run olmo-eval run -m <model> -t ctc:figure        # all 22 tasks, the 2k–32k grid  (108 runs)
+uv run olmo-eval run -m <model> -t ctc:xlong         # everything above 32k            (69 runs)
+uv run olmo-eval run -m <model> -t ctc:r128k         # every task at one rung
+
+# by corpus-tracking demand — the axis the suite is named for
+uv run olmo-eval run -m <model> -t ctc:low           # the 11 O(N) rows               (102 runs)
+uv run olmo-eval run -m <model> -t ctc:high          # the 11 O(N²)+ rows              (75 runs)
+uv run olmo-eval run -m <model> -t ctc:high:figure   # the two axes compose            (53 runs)
 ```
 
-## Evaluation
+`ctc:high:figure` is the cheapest useful probe: grid-sized cost, and it is exactly where a model
+that retrieves well separates from one that tracks a corpus. Prompt templates, parsers, metrics,
+gold conventions and stop rules there are **vendored byte-faithful** from the `ctc` package in this
+repo, so the harness and the generators cannot drift; fix things here and re-vendor.
 
-Additional tools for evaluating OLMo models are available at the [OLMo Eval](https://github.com/allenai/OLMo-eval) and [olmes](https://github.com/allenai/olmes) repositories.
+Suite aggregation is DISPLAY_ONLY by design — the metrics are heterogeneous (f1, pair f1, Kendall
+tau, `ce_pos_recall`, partial credit) and a cross-task mean would be meaningless.
 
-## Development
+### `ctc-eval` — grade your own checkpoint against your own bundles
 
-The Python library source code is located in `src/olmo_core`. The corresponding tests are located in `src/test`. The library docs are located in `docs`. You can build the docs locally with `make docs`.
+```bash
+ctc-eval --list-backends                    # what this install can run
+ctc-eval --ckpt CKPT --tasks contradiction --bundle data/ --backend vllm
+ctc-eval --ckpt CKPT --tasks contradiction --bundle data/ --attn chunked --backend native
+```
 
-Code checks:
+Backends: `vllm` (fastest), `hf`, and `native` — the last grades an OLMo-core checkpoint directly
+and is the only one that can apply the chunked/landmark masks. Install with the matching extra
+(`pip install './ctc[vllm]'`). vLLM specifics, including the serving-copy requirement for
+olmo-exported Qwen3.5 checkpoints, are in
+[`ctc/src/ctc/eval/README.md`](ctc/src/ctc/eval/README.md).
 
-- We use `pytest` to run tests. You can run all tests with `pytest -v src/test`. You can also point `pytest` at a specific test file to run it individually.
-- We use `isort` and `black` for code formatting. Ideally you should integrate these into your editor, but you can also run them manually or configure them with a pre-commit hook. To validate that all files are formatted correctly, run `make style-check`.
-- We use `ruff` as our primary linter. You can run it with `make lint-check`.
-- We use `mypy` as our type checker. You can run it with `make type-check`.
+### Reading the numbers
+
+- **Score every arm with the same backend.** Native-vs-vLLM drift is ~0.08 f1 on contradiction@2k —
+  larger than the eval's own standard error.
+- **Quote `eval_size` and a standard error inline.** Rungs ≥256k hold 125 examples (SE ≈ ±0.041 at
+  f1 ≈ 0.7); `scifact` is 300 and `obliq` 126 at every rung; everything else is 500. In this
+  project `n` means *corpus size*, never eval-set size.
+- **Check `parse_rate` before reading a score off a small model.** Sub-1B checkpoints often cannot
+  answer in the suite's answer space at all, which floors every row below chance instead of ranking
+  them: measured at r2k, the share of generations emitting any `[id]` is 3.5–13.5% at 450M, 5–61%
+  at 810M, ~100% at 1.4B.
+- **A rung label is a build target, not a measured length.** Labels come from the reference prompt
+  path; files carry `_measured_prefill_tokens` where re-measured. Quote the measurement.
+
+---
+
+## Reproducing the paper experiments
+
+[`REPRODUCING.md`](REPRODUCING.md) gives the main experiments as standalone, node-local commands:
+the 22-task dense-vs-chunked grid, the 0.8B/2B/4B model-scale sweep, and the 5-task mixed-SFT
+family — with the reference hyperparameters recovered from the launch records.
+
+## Layout
+
+| where | what |
+|---|---|
+| [`ctc/`](ctc/) | **A self-contained pip package.** Task specs and the prompt/parse/metric contract (`ctc/format`), data generation (`ctc/data`), evaluation (`ctc/eval`). Imports no `olmo_core` except behind the `native` extra. Task JSONL is the boundary between the two halves. |
+| [`src/scripts/ctc/`](src/scripts/ctc/) | The training side — everything that reads or writes OLMo-core formats: shard conversion, marker-embedding repair, the SFT/CPT recipe, Beaker launch. |
+| [`run/`](run/) | `data.sh` → `convert.sh` → `train.sh` → `eval.sh`: thin wrappers that resolve the cluster environment first (interpreter, caches, `PYTHONPATH`). `_env.sh` encodes those traps once. |
+| `src/olmo_core/` | Upstream OLMo-core plus our additions — the attention variants (document-chunked, landmark, hierarchical), composable instance sources, the format-fingerprint callback. |
+| [`AGENTS.md`](AGENTS.md) | Orientation for coding agents, and the short list of things that bite. |
+
+Golden fixtures under `ctc/tests/` were captured from the pre-migration implementation *before*
+this tree was written, so they are independent evidence that the port preserves the numbers.
+Regenerating one to make a test pass destroys that evidence; the fix is the code.
+
+## Relation to OLMo-core
+
+This repository is a fork of [allenai/OLMo-core](https://github.com/allenai/OLMo-core) — AI2's
+training library — with the CTC suite added on top. Everything outside `ctc/`, `run/` and
+`src/scripts/ctc/` is upstream OLMo-core; its own README is kept here as
+[`README-OLMo-core.md`](README-OLMo-core.md) (installation detail, Docker images, code checks,
+`make docs`), and the [API docs](https://olmo-core.readthedocs.io/en/latest/) still apply. Apache
+2.0, as upstream.
 
 ## Citing
 
 ```bibtex
-@misc{olmo20242olmo2furious,
-      title={{2 OLMo 2 Furious}},
-      author={{Team OLMo} and Pete Walsh and Luca Soldaini and Dirk Groeneveld and Kyle Lo and Shane Arora and Akshita Bhagia and Yuling Gu and Shengyi Huang and Matt Jordan and Nathan Lambert and Dustin Schwenk and Oyvind Tafjord and Taira Anderson and David Atkinson and Faeze Brahman and Christopher Clark and Pradeep Dasigi and Nouha Dziri and Michal Guerquin and Hamish Ivison and Pang Wei Koh and Jiacheng Liu and Saumya Malik and William Merrill and Lester James V. Miranda and Jacob Morrison and Tyler Murray and Crystal Nam and Valentina Pyatkin and Aman Rangapur and Michael Schmitz and Sam Skjonsberg and David Wadden and Christopher Wilhelm and Michael Wilson and Luke Zettlemoyer and Ali Farhadi and Noah A. Smith and Hannaneh Hajishirzi},
-      year={2024},
-      eprint={2501.00656},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2501.00656},
+@misc{corpus-task-complexity,
+  title  = {Corpus Task Complexity: long-context tasks that scale with corpus tracking},
+  author = {Singhal, Prasann},
+  year   = {2026},
+  url    = {https://github.com/PrasannS/corpustaskcomplexity}
 }
 ```
+
+OLMo-core itself is [2 OLMo 2 Furious](https://arxiv.org/abs/2501.00656); that citation is in
+[`README-OLMo-core.md`](README-OLMo-core.md).
