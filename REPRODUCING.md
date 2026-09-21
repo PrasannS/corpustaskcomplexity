@@ -1,10 +1,5 @@
 # Reproducing the CTC experiments
 
-Every command here is **standalone and node-local**: a machine with GPUs, this branch, and an
-internet connection for the first data fetch. Nothing below needs AI2 infrastructure — the same
-training entry points accept `--cluster ...` to submit to Beaker instead, but that is an option,
-not a requirement.
-
 ```bash
 git clone https://github.com/PrasannS/corpustaskcomplexity && cd corpustaskcomplexity
 pip install -e '.[all]'        # olmo-core (training side); torch per your CUDA
@@ -104,20 +99,6 @@ CTC_NPROC=8 run/train.sh ctcms-contradiction-cmix-2b \
     --model qwen3_5_2B --tokenizer qwen3_5 --lr 5e-5 --max-steps 2500   # 1 epoch of 20k @ 8/step
 ```
 
-### 3c. The 5-task mixed-SFT family (Qwen3-4B, packed 32k)
-
-The older multi-task comparison: contradiction/nq/oolong/rerank/outlier mixed at weights
-`2 : 1 : 1 : 1.5 : 1.5`, lr 1e-5, ~700M content tokens (1100 steps at 4 nodes for the
-document-chunked arms; 1465 at 2 for dense-packed), YaRN factor 2 past 32k (applied
-automatically), `--arch landmark --mem-freq 63` for the landmark arm.
-
-```bash
-CTC_NPROC=8 run/train.sh q4b-5task-chunked \
-    --data shards/contradiction:2 --data shards/nq:1 --data shards/oolong:1 \
-    --data shards/rerank:1.5 --data shards/outlier:1.5 \
-    --base BASE_Q3_FIXMARK --arch chunked --model qwen3_4B --max-steps 1100
-```
-
 ## 4. Evaluation
 
 ```bash
@@ -129,9 +110,6 @@ ctc-eval --ckpt runs/ctc-contradiction-chunked-mix/step7500 --tasks contradictio
 
 `--bundle data/` grades the ladders you built in step 1. Two rules that keep numbers comparable:
 
-- **Score both arms with the same backend.** The reference grid was vLLM-scored, and
-  native-vs-vLLM drift has been measured at ~0.08 f1 on contradiction@2k — larger than the
-  eval's standard error.
 - Quote every number with its `eval_size` and standard error, and never across bundles.
 
 vLLM specifics (including the serving-copy requirement for olmo-exported Qwen3.5 checkpoints)
