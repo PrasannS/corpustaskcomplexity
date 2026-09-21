@@ -4,6 +4,8 @@ Some corpus tasks like retrieval grow only linearly difficult in corpus size, bu
 
 This repo includes code to reproduce experiments, as well as our training data and CTC-Bench evaluation suite!
 
+If you ever notice any issues or would like help setting up or reproducing experiments please feel free to contact prasann[at]berkeley.edu!
+
 **Browse real examples for CTC-Bench — every task, every rung:**
 [corpus-reasoning-viz.pages.dev](https://corpus-reasoning-viz.pages.dev/) — gold documents
 highlighted, the exact model prompt, the exact target string.
